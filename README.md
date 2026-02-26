@@ -8,7 +8,7 @@ Zelai Xu*, Ruize Zhang*, Chao Yu+, Huining Yuan, Xiangmin Yi, Shilong Ji, Chuqi 
 &nbsp;
 [![Code](https://img.shields.io/badge/Code-000000?style=for-the-badge&logo=github&logoColor=000&logoColor=white)](https://github.com/thu-uav/volleybots)
 &nbsp;
-[![Website](https://img.shields.io/badge/Website-1A73E8?style=for-the-badge&logo=googledocs&logoColor=white)](https://sites.google.com/view/thu-volleybots)
+[![Website](https://img.shields.io/badge/Website-1A73E8?style=for-the-badge&logo=googledocs&logoColor=white)](https://volleybots.github.io)
 
 ![](figures/tasks.png)
 
