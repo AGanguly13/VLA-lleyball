@@ -24,9 +24,9 @@ Zelai Xu*, Ruize Zhang*, Chao Yu+, Huining Yuan, Xiangmin Yi, Shilong Ji, Chuqi 
 
 ## 📣 News
 
-**[2025.11.19]** 🔥 We open-source the [HCSP code](https://github.com/thu-uav/HCSP).
+**[2026.01.31]** 🎉 [JuggleRL](https://arxiv.org/abs/2509.24892) details how we sim‑to‑real on the Solo Bump task and has been accepted to ***ICRA 2026***.
 
-**[2025.09.29]** 🔥 [JuggleRL](https://arxiv.org/abs/2509.24892) details how we sim‑to‑real on the Solo Bump task and has been released on arXiv.
+**[2025.11.19]** 🔥 We open-source the [HCSP code](https://github.com/thu-uav/HCSP) (a hierarchical RL framework to tackle the 3 vs 3 task).
 
 **[2025.09.19]** 🎉 Our testbed is accepted to ***NeurIPS 2025 Datasets & Benchmarks Track***.
 
