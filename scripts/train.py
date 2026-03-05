@@ -18,7 +18,7 @@ from torchrl.envs.transforms import Compose, InitTracker, TransformedEnv
 from tqdm import tqdm
 
 from volley_bots import CONFIG_PATH, init_simulation_app
-from volley_bots.learning import HAPPOPolicy, MADDPGPolicy, MAPPOPolicy, MATPolicy, QMIXPolicy, DQNPolicy, SACPolicy, TD3Policy
+from volley_bots.learning import HAPPOPolicy, MADDPGPolicy, MAPPOPolicy, MATPolicy, QMIXPolicy, DQNPolicy, SACPolicy, TD3Policy, CosmosPolicy
 from volley_bots.utils.torchrl import AgentSpec, SyncDataCollector
 from volley_bots.utils.torchrl.transforms import (
     FromDiscreteAction,
@@ -117,6 +117,7 @@ def main(cfg: DictConfig):
         "dqn": DQNPolicy,
         "sac": SACPolicy,
         "td3": TD3Policy,
+        "reasoning": CosmosPolicy,
     }
 
     env_class = IsaacEnv.REGISTRY[cfg.task.name]
