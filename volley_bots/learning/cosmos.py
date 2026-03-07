@@ -75,11 +75,24 @@ class CosmosPolicy(nn.Module):
         )
 
     def _game_state_summary(self, obs: torch.Tensor) -> str:
-        # create observation vector from obs tensor. TODO: make these more informative
-        # TODO: I literally don't know what the values represent
+        # Observation index map (3v3 symmetric):
+        # 0-2: sym_pos
+        # 3-6: sym_rot
+        # 7-9: sym_vel
+        # 10-12: sym_angular_vel
+        # 13-15: sym_heading
+        # 16-18: sym_up
+        # 19-22: sym_throttle
+        # 23-25: sym_rpos_anchor
+        # 26-28: sym_rpos_ball
+        # 29-31: sym_ball_vel
+        # 32-33: turn_to_obs(self.which_side)
+        # 34-36: torch.cat((self.id, self.id), dim=1)
+        # 37-38: already_hit_in_one_turn_to_obs
+        # 39-56: drones_obs
         o = obs.cpu().tolist()
         return (f"Observation vector {len(o)} values:\n"
-                + "\n".join(f"  [{i}]: {v:.3f}" for i, v in enumerate(o))) # figure out what the indices map to lol
+                + "\n".join(f"  [{i}]: {v:.3f}" for i, v in enumerate(o)))
 
     def _query_llm(self, obs: torch.Tensor):
         print(f"Obs: {obs}")
