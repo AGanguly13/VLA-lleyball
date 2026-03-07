@@ -18,7 +18,7 @@ from torchrl.envs.transforms import Compose, InitTracker, TransformedEnv
 from tqdm import tqdm
 
 from volley_bots import CONFIG_PATH, init_simulation_app
-from volley_bots.learning import HAPPOPolicy, MADDPGPolicy, MAPPOPolicy, MATPolicy, QMIXPolicy, DQNPolicy, SACPolicy, TD3Policy, CosmosPolicy
+from volley_bots.learning import HAPPOPolicy, MAPPOPolicy, CosmosPolicy
 from volley_bots.utils.torchrl import AgentSpec, SyncDataCollector
 from volley_bots.utils.torchrl.transforms import (
     FromDiscreteAction,
@@ -40,7 +40,6 @@ class Every:
         if self.i % self.steps == 0:
             self.func(*args, **kwargs)
         self.i += 1
-
 
 class debug_policy(nn.Module):
 
@@ -89,8 +88,15 @@ class debug_policy(nn.Module):
 from volley_bots.utils.stats import PROCESS_FUNC
 
 
-@hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="train")
+def train_vla(
+    cfg: DictConfig, simulation_app: SimulationApp, env: TransformedEnv, wandb_run
+):
+    pass
+
+@hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="train_vla")
 def main(cfg: DictConfig):
+
+    # 1. Configuration/initialization of WandB tracking, OmegaConf, and sim app
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
@@ -108,15 +114,10 @@ def main(cfg: DictConfig):
 
     from volley_bots.envs.isaac_env import IsaacEnv
 
+    # 2. Set up env + task
     algos = {
         "mappo": MAPPOPolicy,
-        "maddpg": MADDPGPolicy,
-        "mat": MATPolicy,
         "happo": HAPPOPolicy,
-        "qmix": QMIXPolicy,
-        "dqn": DQNPolicy,
-        "sac": SACPolicy,
-        "td3": TD3Policy,
         "reasoning": CosmosPolicy,
     }
 
@@ -126,6 +127,9 @@ def main(cfg: DictConfig):
     def log(info: Dict[str, Any]):
         run.log(info)
 
+        # TODO: what is the "train/" prefix and is that related to file name
+        # its added by the LogOnEpisode transform when it logs metrics
+        # depending on whether the environment is in train or eval mode (look at train.py)
         interested_keys = [
             "train/stats.return",
             "train/stats.score",
@@ -157,6 +161,8 @@ def main(cfg: DictConfig):
     )
     transforms = [InitTracker(), logger]
 
+    # 3. Action space transforms to discretize the action space or wrap w/ controller
+    # TODO: is the action space already multi-discrete? ----> (not always, check agent_spec)
     # optionally discretize the action space or use a controller
     action_transform: str = cfg.algo.get("action_transform", None)
     print("action_transform", action_transform)
@@ -178,7 +184,8 @@ def main(cfg: DictConfig):
             transforms.append(transform)
         else:
             raise NotImplementedError(f"Unknown action transform: {action_transform}")
-
+        
+    # 4. Policy + agent setup from config and wrap env in transforms
     env = TransformedEnv(base_env, Compose(*transforms)).train()
     env.set_seed(cfg.seed)
 
@@ -231,7 +238,7 @@ def main(cfg: DictConfig):
         return_same_td=True,
     )
 
-    @torch.no_grad()
+    # 5. Evaluation function
     def evaluate(policy=None, only_eval_one_traj: bool = False, eval_type: str = None):
         """
         Evaluate the policy.
@@ -240,6 +247,7 @@ def main(cfg: DictConfig):
             eval_type: str, the type of evaluation used if only_eval_one_traj=true, "ctbr" or "log_actions"
         """
         policy = policy
+        info = {}
         frames = []
 
         def record_frame(*args, **kwargs):
@@ -464,14 +472,21 @@ def main(cfg: DictConfig):
         env.train()
 
         if len(frames):
+            # video_array = torch.stack(frames)
             video_array = np.stack(frames).transpose(0, 3, 1, 2)
+            # print(video_array.shape) # (max_steps/2,H,W,C)
             info["recording"] = wandb.Video(
                 video_array, fps=0.5 / cfg.sim.dt, format="mp4"
             )
+
+        if hasattr(policy, "set_video_frames"):
+            policy.set_video_frames(frames)
+
         frames.clear()
 
         return info
 
+    # 6. Training loop
     if only_eval == False:
         pbar = tqdm(collector, total=total_frames // frames_per_batch)
         env.train()
@@ -515,6 +530,7 @@ def main(cfg: DictConfig):
             logging.info(f"Save checkpoint to {str(ckpt_path)}")
             torch.save(policy.state_dict(), ckpt_path)
 
+    # 7. Save checkpoint, log results, and clean up
     logging.info(f"Final Eval at {collector._frames} steps.")
     info = {"env_frames": collector._frames}
     info.update(
@@ -526,6 +542,13 @@ def main(cfg: DictConfig):
     run.log(info)
 
     wandb.save(os.path.join(run.dir, "checkpoint*"))
+    
+    # Save reasoning log if using CosmosPolicy
+    if hasattr(policy, "save_reasoning_log"):
+        log_path = os.path.join(run.dir, "reasoning_log.json")
+        policy.save_reasoning_log(log_path)
+        wandb.save(log_path)
+    
     wandb.finish()
 
     simulation_app.close()

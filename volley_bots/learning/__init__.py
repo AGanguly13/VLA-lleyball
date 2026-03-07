@@ -4,6 +4,8 @@ from .mappo import MAPPOPolicy
 from .mat import MATPolicy
 from .qmix import QMIXPolicy
 
+from .cosmos import CosmosPolicy
+
 from .dqn import DQNPolicy
 from .sac import SACPolicy
 from .td3 import TD3Policy
