@@ -31,7 +31,7 @@ class CosmosReasoner:
         self,
         model_name: str = "nvidia/Cosmos-Reason2-8B",
         commands: Optional[List[str]] = None,
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = 2048,
         server_url: str = "http://localhost:8000",
         timeout: float = 60.0,
     ):
