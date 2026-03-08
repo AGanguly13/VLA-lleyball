@@ -681,6 +681,130 @@ class AttitudeController(Transform):
         return tensordict
 
 
+class CosmosCommandTransform(Transform):
+    """Appends a cached high-level command (one-hot) to the observation vector.
+
+    When a :class:`~volley_bots.utils.cosmos.CosmosReasoner` and ``base_env``
+    are provided, the transform periodically renders frames from the
+    environment, feeds them to the VLM, and uses the resulting command.
+    Otherwise it falls back to random commands during training.
+
+    At eval time the caller can set specific commands via :meth:`set_command`.
+    """
+
+    def __init__(
+        self,
+        num_commands: int = 6,
+        num_envs: int = 1,
+        call_every_k: int = 50,
+        device: str = "cuda",
+        reasoner=None,
+        base_env=None,
+        record_every: int = 5,
+        max_frames: int = 8,
+    ):
+        super().__init__(in_keys=[("agents", "observation")])
+        self.num_commands = num_commands
+        self.call_every_k = call_every_k
+        self._step_count = 0
+        self.cached_cmd = torch.zeros(num_envs, 1, num_commands, device=device)
+        self.cached_cmd[..., 0] = 1.0  # default: first command
+
+        self.reasoner = reasoner
+        self.base_env = base_env
+        self.record_every = record_every
+        self.max_frames = max_frames
+        self._frame_buffer: list = []
+        self.last_reasoning: str = ""
+        self.last_command_name: str = ""
+
+        import logging
+        self._logger = logging.getLogger(__name__)
+
+    @property
+    def use_reasoner(self) -> bool:
+        return self.reasoner is not None and self.base_env is not None
+
+    def transform_observation_spec(self, observation_spec):
+        spec = observation_spec[("agents", "observation")]
+        new_shape = (*spec.shape[:-1], spec.shape[-1] + self.num_commands)
+        observation_spec[("agents", "observation")] = UnboundedContinuousTensorSpec(
+            new_shape, device=spec.device
+        )
+        return observation_spec
+
+    def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        obs = tensordict.get(("agents", "observation"))
+        cmd = self.cached_cmd.expand(*obs.shape[:-1], self.num_commands)
+        tensordict.set(
+            ("agents", "observation"), torch.cat([obs, cmd], dim=-1)
+        )
+        return tensordict
+
+    def _reset(
+        self, tensordict: TensorDictBase, tensordict_reset: TensorDictBase
+    ) -> TensorDictBase:
+        return self._call(tensordict_reset)
+
+    def _capture_frame(self):
+        """Render and buffer a frame from the environment."""
+        frame = self.base_env.render(mode="rgb_array")
+        self._frame_buffer.append(frame)
+
+    def _update_command_from_reasoner(self):
+        """Query the Cosmos reasoner with buffered frames."""
+        if not self._frame_buffer:
+            raise RuntimeError("No frames buffered for Cosmos inference")
+
+        cmd_idx, reasoning, raw = self.reasoner.get_command_with_reasoning(
+            self._frame_buffer, max_frames=self.max_frames
+        )
+        self._frame_buffer.clear()
+
+        n = self.cached_cmd.shape[0]
+        cmd_indices = torch.full(
+            (n,), cmd_idx, device=self.cached_cmd.device, dtype=torch.long
+        )
+        self.set_command(cmd_indices)
+
+        self.last_command_name = self.reasoner.commands[cmd_idx]
+        self.last_reasoning = reasoning
+        print(
+            f"\n{'='*60}\n"
+            f"[Cosmos] Step {self._step_count} → command: {self.last_command_name}\n"
+            f"{'─'*60}\n"
+            f"Reasoning:\n{reasoning}\n"
+            f"{'='*60}\n",
+            flush=True,
+        )
+
+    def _step(
+        self, tensordict: TensorDictBase, next_tensordict: TensorDictBase
+    ) -> TensorDictBase:
+        self._step_count += 1
+
+        if self.use_reasoner and self._step_count % self.record_every == 0:
+            self._capture_frame()
+
+        if self._step_count % self.call_every_k == 0 and self.use_reasoner:
+            self._update_command_from_reasoner()
+
+        return self._call(next_tensordict)
+
+    # ------------------------------------------------------------------
+    # Public helpers for setting commands from outside
+    # ------------------------------------------------------------------
+
+    def set_command(self, cmd_indices: torch.Tensor):
+        """Set per-env commands from index tensor of shape ``(num_envs,)``."""
+        self.cached_cmd.zero_()
+        onehot = torch.nn.functional.one_hot(
+            cmd_indices.long(), self.num_commands
+        ).float()
+        self.cached_cmd[:, 0, :] = onehot
+
+
+
 class History(Transform):
     def __init__(
         self,

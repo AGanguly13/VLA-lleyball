@@ -21,6 +21,7 @@ from volley_bots import CONFIG_PATH, init_simulation_app
 from volley_bots.learning import HAPPOPolicy, MADDPGPolicy, MAPPOPolicy, MATPolicy, QMIXPolicy, DQNPolicy, SACPolicy, TD3Policy
 from volley_bots.utils.torchrl import AgentSpec, SyncDataCollector
 from volley_bots.utils.torchrl.transforms import (
+    CosmosCommandTransform,
     FromDiscreteAction,
     FromMultiDiscreteAction,
     History,
@@ -155,6 +156,42 @@ def main(cfg: DictConfig):
         process_func=process_func,
     )
     transforms = [InitTracker(), logger]
+
+    # optionally add Cosmos high-level command to the observation
+    cosmos_cfg = cfg.get("cosmos", {})
+    cosmos_enabled = cosmos_cfg.get("enabled", False)
+    cosmos_transform = None
+    if cosmos_enabled:
+        from volley_bots.utils.cosmos import CosmosReasoner
+
+        server_url = cosmos_cfg.get("server_url")
+        if not server_url:
+            raise ValueError("cosmos.enabled=true requires cosmos.server_url")
+
+        reasoner = CosmosReasoner(
+            model_name=cosmos_cfg.get("model_name", "nvidia/Cosmos-Reason2-2B"),
+            max_new_tokens=cosmos_cfg.get("max_new_tokens", 512),
+            server_url=server_url,
+            timeout=cosmos_cfg.get("timeout", 60.0),
+        )
+        base_env.enable_render(True)
+
+        cosmos_transform = CosmosCommandTransform(
+            num_commands=cosmos_cfg.get("num_commands", 6),
+            num_envs=cfg.env.num_envs,
+            call_every_k=cosmos_cfg.get("call_every_k", 50),
+            device=cfg.sim.device,
+            reasoner=reasoner,
+            base_env=base_env,
+            record_every=cosmos_cfg.get("record_every", 5),
+            max_frames=cosmos_cfg.get("max_frames", 8),
+        )
+        transforms.append(cosmos_transform)
+        logging.info(
+            f"Cosmos enabled: server={server_url}, "
+            f"{cosmos_transform.num_commands} commands, "
+            f"update every {cosmos_transform.call_every_k} steps"
+        )
 
     # optionally discretize the action space or use a controller
     action_transform: str = cfg.algo.get("action_transform", None)
