@@ -128,11 +128,8 @@ class CosmosReasoner:
             {
                 "role": "user",
                 "content": image_content + [{"type": "text", "text": prompt}],
-            },
-            {
-                "role": "assistant",
-                "content": "<think>\n",
-            },
+            }
+            # Note on removed <think> prefix: Cosmos reason should always be reasoning anyways, and it might've been causing inconsistent behavior not aligning with text extraction
         ]
 
     # ------------------------------------------------------------------
@@ -181,7 +178,7 @@ class CosmosReasoner:
         output_text = result["choices"][0]["message"]["content"]
         # The assistant message was primed with "<think>\n", so prepend it
         # back to reconstruct the full response.
-        full_text = "<think>\n" + output_text
+        full_text = output_text.strip()
         reasoning = self._extract_reasoning(full_text)
         cmd_idx = self._parse_command(full_text)
         return cmd_idx, reasoning, full_text

@@ -769,6 +769,10 @@ class CosmosCommandTransform(Transform):
 
         self.last_command_name = self.reasoner.commands[cmd_idx]
         self.last_reasoning = reasoning
+
+        if not reasoning.strip():
+            reasoning = "[NO_REASONING_RETURNED]"
+        
         print(
             f"\n{'='*60}\n"
             f"[Cosmos] Step {self._step_count} → command: {self.last_command_name}\n"
