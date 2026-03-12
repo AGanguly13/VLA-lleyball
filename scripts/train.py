@@ -185,6 +185,9 @@ def main(cfg: DictConfig):
             base_env=base_env,
             record_every=cosmos_cfg.get("record_every", 5),
             max_frames=cosmos_cfg.get("max_frames", 8),
+            logger_func=log,
+            counterfactual_enabled=cosmos_cfg.get("counterfactual_enabled", True),
+            counterfactual_threshold=cosmos_cfg.get("counterfactual_threshold", 0.1),
         )
         transforms.append(cosmos_transform)
         logging.info(
@@ -222,6 +225,8 @@ def main(cfg: DictConfig):
     policy = algos[cfg.algo.name.lower()](
         cfg.algo, agent_spec=agent_spec, device="cuda"
     )
+    if cosmos_transform is not None:
+        cosmos_transform.attach_policy(policy, log)
 
     if cfg.get("policy_checkpoint_path") is not None:
         policy.load_state_dict(torch.load(cfg.policy_checkpoint_path))
@@ -570,3 +575,4 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
+
