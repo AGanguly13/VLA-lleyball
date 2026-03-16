@@ -451,12 +451,107 @@ class MAPPOPolicy(object):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        self.actor_params = state_dict["actor_params"]
+        def _shape_safe_load_tensor_dict_params(current_params, loaded_params, name="actor_params"):
+            current_td = current_params.to_tensordict()
+            loaded_td = loaded_params.to_tensordict() if hasattr(loaded_params, "to_tensordict") else loaded_params
+
+            loaded_count = 0
+            skipped = []
+
+            for key in current_td.keys(True, True):
+                if key not in loaded_td.keys(True, True):
+                    skipped.append((key, "missing"))
+                    continue
+
+                cur = current_td.get(key)
+                old = loaded_td.get(key)
+
+                # exact match
+                if cur.shape == old.shape:
+                    current_td.set(key, old.to(cur.device, cur.dtype))
+                    loaded_count += 1
+                    continue
+
+                # special case: widened input dimension, e.g. [out_dim, old_in] -> [out_dim, new_in]
+                # zero-pad the new extra columns so old policy behavior is preserved initially
+                if (
+                    cur.ndim == 2
+                    and old.ndim == 2
+                    and cur.shape[0] == old.shape[0]
+                    and cur.shape[1] > old.shape[1]
+                ):
+                    padded = torch.zeros_like(cur)
+                    padded[:, : old.shape[1]] = old.to(cur.device, cur.dtype)
+                    current_td.set(key, padded)
+                    loaded_count += 1
+                    continue
+
+                # exact same shape except batch/share dimensions would already fail above;
+                # for biases or anything else mismatched, skip
+                skipped.append((key, (tuple(old.shape), tuple(cur.shape))))
+
+            new_params = TensorDictParams(current_td)
+            print(f"[Checkpoint] {name}: loaded {loaded_count} tensors, skipped {len(skipped)}")
+            if skipped:
+                print(f"[Checkpoint] {name} skipped examples: {skipped[:10]}")
+            return new_params
+
+        def _shape_safe_load_module(module, loaded_sd, name="critic"):
+            current_sd = module.state_dict()
+            loaded_count = 0
+            skipped = []
+
+            for k, cur in current_sd.items():
+                if k not in loaded_sd:
+                    skipped.append((k, "missing"))
+                    continue
+
+                old = loaded_sd[k]
+
+                # exact match
+                if cur.shape == old.shape:
+                    current_sd[k] = old.to(cur.device, cur.dtype)
+                    loaded_count += 1
+                    continue
+
+                # widened input layer: [out_dim, old_in] -> [out_dim, new_in]
+                if (
+                    cur.ndim == 2
+                    and old.ndim == 2
+                    and cur.shape[0] == old.shape[0]
+                    and cur.shape[1] > old.shape[1]
+                ):
+                    padded = torch.zeros_like(cur)
+                    padded[:, : old.shape[1]] = old.to(cur.device, cur.dtype)
+                    current_sd[k] = padded
+                    loaded_count += 1
+                    continue
+
+                skipped.append((k, (tuple(old.shape), tuple(cur.shape))))
+
+            module.load_state_dict(current_sd, strict=False)
+            print(f"[Checkpoint] {name}: loaded {loaded_count} tensors, skipped {len(skipped)}")
+            if skipped:
+                print(f"[Checkpoint] {name} skipped examples: {skipped[:10]}")
+
+        # actor params
+        self.actor_params = _shape_safe_load_tensor_dict_params(
+            self.actor_params, state_dict["actor_params"], name="actor_params"
+        )
         self.actor_opt = torch.optim.Adam(
             self.actor_params.parameters(), lr=self.cfg.actor.lr
         )
-        self.critic.load_state_dict(state_dict["critic"])
-        self.value_normalizer.load_state_dict(state_dict["value_normalizer"])
+
+        # critic
+        _shape_safe_load_module(self.critic, state_dict["critic"], name="critic")
+
+        # value normalizer usually matches; if not, skip safely
+        if "value_normalizer" in state_dict:
+            try:
+                self.value_normalizer.load_state_dict(state_dict["value_normalizer"])
+                print("[Checkpoint] value_normalizer loaded")
+            except Exception as e:
+                print(f"[Checkpoint] value_normalizer skipped: {e}")
 
     def eval(self):
         self.actor.eval()
@@ -789,3 +884,4 @@ class Critic(nn.Module):
         if len(self.output_shape) > 1:
             values = values.unflatten(-1, self.output_shape)
         return values, rnn_state
+
