@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tensordict.tensordict import TensorDict, TensorDictBase
 from tensordict.utils import NestedKey
 from torchrl.data import (
@@ -679,6 +680,388 @@ class AttitudeController(Transform):
         torch.nan_to_num_(cmds, 0.0)
         tensordict.set(self.action_key, cmds)
         return tensordict
+
+
+class CosmosCommandTransform(Transform):
+    """Appends a cached high-level command (one-hot) to the observation vector.
+
+    When a :class:`~volley_bots.utils.cosmos.CosmosReasoner` and ``base_env``
+    are provided, the transform periodically renders frames from the
+    environment, feeds them to the VLM, and uses the resulting command.
+    Otherwise it falls back to random commands during training.
+
+    At eval time the caller can set specific commands via :meth:`set_command`.
+    """
+
+    def __init__(
+        self,
+        num_commands: int = 6,
+        num_envs: int = 1,
+        call_every_k: int = 50,
+        device: str = "cuda",
+        reasoner=None,
+        base_env=None,
+        record_every: int = 5,
+        max_frames: int = 8,
+        logger_func: Callable[[Dict[str, Any]], None] = None,
+        counterfactual_enabled: bool = True,
+        counterfactual_threshold: float = 0.1,
+    ):
+        super().__init__(in_keys=[("agents", "observation")])
+        self.num_commands = num_commands
+        self.call_every_k = call_every_k
+        self._step_count = 0
+        self.cached_cmd = torch.zeros(num_envs, 1, num_commands, device=device)
+        self.cached_cmd[..., 0] = 1.0  # default: first command
+
+        self.reasoner = reasoner
+        self.base_env = base_env
+        self.record_every = record_every
+        self.max_frames = max_frames
+        self._frame_buffer: list = []
+        self.last_reasoning: str = ""
+        self.last_command_name: str = ""
+        self.logger_func = logger_func
+        self.counterfactual_enabled = counterfactual_enabled
+        self.counterfactual_threshold = counterfactual_threshold
+        self.policy = None
+        self._cf_call_count = 0
+        self._cf_running_stats = defaultdict(
+            lambda: {
+                "calls": 0,
+                "action_l2": 0.0,
+                "action_l1": 0.0,
+                "normalized_l2": 0.0,
+                "cosine_distance": 0.0,
+                "changed_fraction": 0.0,
+                "sign_flip_fraction": 0.0,
+                "value_delta_abs": 0.0,
+            }
+        )
+        self._cf_running_by_chosen = defaultdict(
+            lambda: {
+                "calls": 0,
+                "mean_alt_action_l2": 0.0,
+                "mean_alt_normalized_l2": 0.0,
+                "mean_alt_value_delta_abs": 0.0,
+            }
+        )
+
+        import logging
+
+        self._logger = logging.getLogger(__name__)
+
+    @property
+    def use_reasoner(self) -> bool:
+        return self.reasoner is not None and self.base_env is not None
+
+    def transform_observation_spec(self, observation_spec):
+        spec = observation_spec[("agents", "observation")]
+        new_shape = (*spec.shape[:-1], spec.shape[-1] + self.num_commands)
+        observation_spec[("agents", "observation")] = UnboundedContinuousTensorSpec(
+            new_shape, device=spec.device
+        )
+        return observation_spec
+
+    def attach_policy(
+        self,
+        policy,
+        logger_func: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
+        """Attach the rollout policy for side-effect-only counterfactual probes."""
+        self.policy = policy
+        if logger_func is not None:
+            self.logger_func = logger_func
+
+    def _append_command(
+        self, tensordict: TensorDictBase, command_tensor: torch.Tensor
+    ) -> TensorDictBase:
+        obs = tensordict.get(("agents", "observation"))
+        cmd = command_tensor.expand(*obs.shape[:-1], self.num_commands)
+        tensordict.set(("agents", "observation"), torch.cat([obs, cmd], dim=-1))
+        return tensordict
+
+    def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        return self._append_command(tensordict, self.cached_cmd)
+
+    def _reset(
+        self, tensordict: TensorDictBase, tensordict_reset: TensorDictBase
+    ) -> TensorDictBase:
+        return self._call(tensordict_reset)
+
+    def _capture_frame(self):
+        """Render and buffer a frame from the environment."""
+        frame = self.base_env.render(mode="rgb_array")
+        self._frame_buffer.append(frame)
+
+    def _run_policy_probe(self, tensordict: TensorDictBase):
+        if self.policy is None:
+            return None
+        probe_td = tensordict.clone()
+        with torch.no_grad():
+            try:
+                return self.policy(probe_td, deterministic=True)
+            except TypeError:
+                return self.policy(probe_td)
+
+    @staticmethod
+    def _extract_scalar(value: Optional[torch.Tensor]) -> float:
+        if value is None:
+            return 0.0
+        if not isinstance(value, torch.Tensor):
+            return float(value)
+        return value.detach().float().mean().item()
+
+    def _log_counterfactual_metrics(
+        self,
+        chosen_idx: int,
+        base_output: TensorDictBase,
+        raw_tensordict: TensorDictBase,
+    ):
+        if (
+            not self.counterfactual_enabled
+            or self.policy is None
+            or self.logger_func is None
+        ):
+            return
+
+        base_action = base_output.get(("agents", "action"), None)
+        if base_action is None:
+            return
+
+        base_action = base_action.detach()
+        base_value = base_output.get("state_value", None)
+        base_value = None if base_value is None else base_value.detach()
+        base_norm = base_action.norm(dim=-1).mean()
+        command_names = getattr(self.reasoner, "commands", None) or [
+            f"command_{i}" for i in range(self.num_commands)
+        ]
+        prefix = "train" if self.training else "eval"
+
+        table = None
+        try:
+            import wandb
+
+            table = wandb.Table(
+                columns=[
+                    "step",
+                    "chosen_command",
+                    "candidate_command",
+                    "is_chosen",
+                    "action_l2",
+                    "action_l1",
+                    "normalized_l2",
+                    "cosine_distance",
+                    "changed_fraction",
+                    "sign_flip_fraction",
+                    "value_delta_abs",
+                ]
+            )
+        except Exception:
+            table = None
+
+        call_metrics = {}
+        alt_l2_values = []
+        alt_norm_l2_values = []
+        alt_value_delta_values = []
+
+        for cmd_idx, cmd_name in enumerate(command_names):
+            cmd_tensor = torch.zeros_like(self.cached_cmd)
+            cmd_tensor[..., cmd_idx] = 1.0
+            probe_td = raw_tensordict.clone()
+            probe_td = self._append_command(probe_td, cmd_tensor)
+            probe_output = self._run_policy_probe(probe_td)
+            if probe_output is None:
+                return
+
+            probe_action = probe_output.get(("agents", "action"), None)
+            if probe_action is None:
+                return
+            probe_action = probe_action.detach()
+            delta = probe_action - base_action
+
+            action_l2 = delta.norm(dim=-1).mean()
+            action_l1 = delta.abs().mean()
+            normalized_l2 = action_l2 / (base_norm + 1e-8)
+            cosine_distance = (
+                1.0
+                - F.cosine_similarity(base_action, probe_action, dim=-1, eps=1e-8).mean()
+            )
+            changed_fraction = (
+                (delta.abs() > self.counterfactual_threshold).float().mean()
+            )
+            sign_flip_fraction = ((base_action * probe_action) < 0).float().mean()
+
+            probe_value = probe_output.get("state_value", None)
+            if base_value is not None and probe_value is not None:
+                value_delta_abs = (probe_value.detach() - base_value).abs().mean()
+            else:
+                value_delta_abs = None
+
+            metrics = {
+                "action_l2": self._extract_scalar(action_l2),
+                "action_l1": self._extract_scalar(action_l1),
+                "normalized_l2": self._extract_scalar(normalized_l2),
+                "cosine_distance": self._extract_scalar(cosine_distance),
+                "changed_fraction": self._extract_scalar(changed_fraction),
+                "sign_flip_fraction": self._extract_scalar(sign_flip_fraction),
+                "value_delta_abs": self._extract_scalar(value_delta_abs),
+            }
+
+            if table is not None:
+                table.add_data(
+                    int(self._step_count),
+                    command_names[chosen_idx],
+                    cmd_name,
+                    int(cmd_idx == chosen_idx),
+                    metrics["action_l2"],
+                    metrics["action_l1"],
+                    metrics["normalized_l2"],
+                    metrics["cosine_distance"],
+                    metrics["changed_fraction"],
+                    metrics["sign_flip_fraction"],
+                    metrics["value_delta_abs"],
+                )
+
+            if cmd_idx != chosen_idx:
+                alt_l2_values.append(metrics["action_l2"])
+                alt_norm_l2_values.append(metrics["normalized_l2"])
+                alt_value_delta_values.append(metrics["value_delta_abs"])
+
+                for metric_name, metric_value in metrics.items():
+                    call_metrics[
+                        f"{prefix}/cosmos_counterfactual/by_command/{cmd_name}/{metric_name}"
+                    ] = metric_value
+
+                running_stats = self._cf_running_stats[cmd_name]
+                running_stats["calls"] += 1
+                for metric_name, metric_value in metrics.items():
+                    running_stats[metric_name] += metric_value
+
+        self._cf_call_count += 1
+        chosen_name = command_names[chosen_idx]
+        chosen_stats = self._cf_running_by_chosen[chosen_name]
+        chosen_stats["calls"] += 1
+        chosen_stats["mean_alt_action_l2"] += float(np.mean(alt_l2_values))
+        chosen_stats["mean_alt_normalized_l2"] += float(np.mean(alt_norm_l2_values))
+        chosen_stats["mean_alt_value_delta_abs"] += float(np.mean(alt_value_delta_values))
+
+        summary = {
+            f"{prefix}/cosmos_counterfactual/step": int(self._step_count),
+            f"{prefix}/cosmos_counterfactual/calls": self._cf_call_count,
+            f"{prefix}/cosmos_counterfactual/chosen_command_idx": chosen_idx,
+            f"{prefix}/cosmos_counterfactual/chosen_command": chosen_name,
+            f"{prefix}/cosmos_counterfactual/summary/mean_alt_action_l2": float(
+                np.mean(alt_l2_values)
+            ),
+            f"{prefix}/cosmos_counterfactual/summary/max_alt_action_l2": float(
+                np.max(alt_l2_values)
+            ),
+            f"{prefix}/cosmos_counterfactual/summary/min_alt_action_l2": float(
+                np.min(alt_l2_values)
+            ),
+            f"{prefix}/cosmos_counterfactual/summary/mean_alt_normalized_l2": float(
+                np.mean(alt_norm_l2_values)
+            ),
+            f"{prefix}/cosmos_counterfactual/summary/mean_alt_value_delta_abs": float(
+                np.mean(alt_value_delta_values)
+            ),
+            f"{prefix}/cosmos_counterfactual/summary/base_action_norm": self._extract_scalar(
+                base_norm
+            ),
+        }
+        summary.update(call_metrics)
+
+        for cmd_name, running_stats in self._cf_running_stats.items():
+            calls = max(1, running_stats["calls"])
+            for metric_name, metric_sum in running_stats.items():
+                if metric_name == "calls":
+                    continue
+                summary[
+                    f"{prefix}/cosmos_counterfactual_running/by_command/{cmd_name}/{metric_name}"
+                ] = metric_sum / calls
+
+        for chosen_cmd, running_stats in self._cf_running_by_chosen.items():
+            calls = max(1, running_stats["calls"])
+            summary[
+                f"{prefix}/cosmos_counterfactual_running/by_chosen/{chosen_cmd}/calls"
+            ] = running_stats["calls"]
+            summary[
+                f"{prefix}/cosmos_counterfactual_running/by_chosen/{chosen_cmd}/mean_alt_action_l2"
+            ] = running_stats["mean_alt_action_l2"] / calls
+            summary[
+                f"{prefix}/cosmos_counterfactual_running/by_chosen/{chosen_cmd}/mean_alt_normalized_l2"
+            ] = running_stats["mean_alt_normalized_l2"] / calls
+            summary[
+                f"{prefix}/cosmos_counterfactual_running/by_chosen/{chosen_cmd}/mean_alt_value_delta_abs"
+            ] = running_stats["mean_alt_value_delta_abs"] / calls
+
+        if table is not None:
+            summary[f"{prefix}/cosmos_counterfactual/table"] = table
+
+        self.logger_func(summary)
+
+    def _update_command_from_reasoner(self, next_tensordict: TensorDictBase):
+        """Query the Cosmos reasoner with buffered frames."""
+        if not self._frame_buffer:
+            raise RuntimeError("No frames buffered for Cosmos inference")
+
+        cmd_idx, reasoning, raw = self.reasoner.get_command_with_reasoning(
+            self._frame_buffer, max_frames=self.max_frames
+        )
+        self._frame_buffer.clear()
+
+        n = self.cached_cmd.shape[0]
+        cmd_indices = torch.full(
+            (n,), cmd_idx, device=self.cached_cmd.device, dtype=torch.long
+        )
+        self.set_command(cmd_indices)
+
+        self.last_command_name = self.reasoner.commands[cmd_idx]
+        self.last_reasoning = reasoning
+
+        base_probe_td = next_tensordict.clone()
+        base_probe_td = self._append_command(base_probe_td, self.cached_cmd)
+        base_output = self._run_policy_probe(base_probe_td)
+        if base_output is not None:
+            self._log_counterfactual_metrics(cmd_idx, base_output, next_tensordict)
+
+        if not reasoning.strip():
+            reasoning = "[NO_REASONING_RETURNED]"
+
+        print(
+            f"\n{'='*60}\n"
+            f"[Cosmos] Step {self._step_count} -> command: {self.last_command_name}\n"
+            f"{'-'*60}\n"
+            f"Reasoning:\n{reasoning}\n"
+            f"{'='*60}\n",
+            flush=True,
+        )
+
+    def _step(
+        self, tensordict: TensorDictBase, next_tensordict: TensorDictBase
+    ) -> TensorDictBase:
+        self._step_count += 1
+
+        if self.use_reasoner and self._step_count % self.record_every == 0:
+            self._capture_frame()
+
+        if self._step_count % self.call_every_k == 0 and self.use_reasoner:
+            self._update_command_from_reasoner(next_tensordict)
+
+        return self._call(next_tensordict)
+
+    # ------------------------------------------------------------------
+    # Public helpers for setting commands from outside
+    # ------------------------------------------------------------------
+
+    def set_command(self, cmd_indices: torch.Tensor):
+        """Set per-env commands from index tensor of shape ``(num_envs,)``."""
+        self.cached_cmd.zero_()
+        onehot = torch.nn.functional.one_hot(
+            cmd_indices.long(), self.num_commands
+        ).float()
+        self.cached_cmd[:, 0, :] = onehot
 
 
 class History(Transform):

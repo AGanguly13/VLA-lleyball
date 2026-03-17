@@ -20,6 +20,17 @@ policy_checkpoint_path:
 
 use_local_usd: true
 
+cosmos:
+  enabled: true
+  num_commands: 6
+  call_every_k: 50
+  record_every: 5       # capture a frame every N env steps
+  max_frames: 8         # max frames subsampled for VLM input
+  model_name: "nvidia/Cosmos-Reason2-8B"
+  max_new_tokens: 1024
+  server_url:           # vLLM endpoint, e.g. "http://localhost:8000"
+  timeout: 60.0         # HTTP request timeout in seconds
+
 viewer:
   resolution: [960, 720]
   eye: [18., 0., 10.] # [7., 0., 5.]
